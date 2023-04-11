@@ -537,11 +537,11 @@ plan(multisession, workers = 4)
 
 sim_d_and_fit <- function(prior_mean_bias, prior_sd_bias, prior_mean_beta, prior_sd_beta, prior_mean_conf, prior_sd_conf) {
 
-    data <- list(n = 1200, h = d1$self, memory = d1$memory, confidence = d1$confidence, prior_mean_bias = prior_mean_bias, prior_sd_bias = prior_sd_bias, prior_mean_beta = prior_mean_beta, prior_sd_beta = prior_sd_beta, prior_mean_conf = prior_mean_conf, prior_sd_conf = prior_sd_conf)
+    data <- list(n = 1200, h = d1$self, memory = d1$memory, other = d1$other, confidence = d1$confidence, prior_mean_bias = prior_mean_bias, prior_sd_bias = prior_sd_bias, prior_mean_beta = prior_mean_beta, prior_sd_beta = prior_sd_beta, prior_mean_conf = prior_mean_conf, prior_sd_conf = prior_sd_conf)
   
     samples <- mod$sample(
       data = data,
-      seed = 1000,
+      seed = 123,
       chains = 1,
       parallel_chains = 1,
       threads_per_chain = 1,
