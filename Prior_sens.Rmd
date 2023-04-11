@@ -1,0 +1,610 @@
+---
+title: "Prior_sens_Kasper"
+output: html_document
+date: "2023-02-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# packages
+pacman::p_load(tidyverse,
+        here,
+        posterior,
+        cmdstanr,
+        brms, tidybayes)
+
+```
+
+
+## Matching pennies with LSWS 
+
+### Simulating data
+```{r}
+# set up
+ntrials <- 120
+nagents <- 10
+bias <- 0.6
+follow_bias <- 0.8
+rate <- 0.5
+noise <- 0.2
+
+# agent function
+LSWSAgentBias_f <- function(prevChoice, Feedback, bias, follow_bias){ 
+  # if the agent won on previous round - shift 
+  if (Feedback == 1 & prevChoice == 0){
+    choice = rbinom(1, 1, inv_logit_scaled(bias + follow_bias * 1))
+  }
+  else if (Feedback == 1 & prevChoice == 1){
+    choice = rbinom(1, 1, inv_logit_scaled(bias + follow_bias * -1))
+  }
+  # if the agent lost - stay
+  else if (Feedback == 0 & prevChoice == 0){
+    choice = rbinom(1, 1, inv_logit_scaled(bias + follow_bias * -1))
+  }
+  else if (Feedback == 0 & prevChoice == 1){
+    choice = rbinom(1, 1, inv_logit_scaled(bias + follow_bias * 1))
+  }
+  return(choice) 
+}
+
+RandomAgentNoise_f <- function(rate, noise) {
+  choice <- rbinom(1, 1, rate)
+  if (rbinom(1, 1, noise) == 1) 
+  {choice = rbinom(1, 1, 0.5)}
+  return(choice)
+  }
+
+
+df <- NULL
+sim <- function(nagents, ntrials, bias, follow_bias){
+
+  for (agent in 1:nagents){
+    self <- rep(NA, ntrials) 
+    other <- rep(NA, ntrials) 
+    feedback <- rep(NA, ntrials)
+    self[1] <- rbinom(1, 1, 0.5)
+    other[1] <- rbinom(1, 1, 0.5)
+    # HERE I REMOVED THE FEEDBACK LINE
+    
+    for (i in 2:ntrials){ # HERE I GENERATE FEEDBACK BASED ON THE PREVIOUS TRIAL TO INFORM THE CURRENT TRIAL
+      if (self[i-1] == other[i-1]){ 
+          feedback[i-1] = 1 } 
+        else {
+          feedback[i-1] = 0 } 
+        self[i] <- LSWSAgentBias_f(self[i-1], feedback[i-1], bias, follow_bias) # HERE I USE PREVIOUS CHOICE AND PREV FEEDBACK TO GENERATE CURRENT CHOICE
+        other[i] <- RandomAgentNoise_f(rate = rate, noise = noise) 
+    }   
+    feedback[ntrials] <- ifelse(self[ntrials] == other[ntrials], 1, 0) # HERE I GENERATE FEEDBACK FOR THE LAST TRIAL, TO AVOID LOSING THAT ROW LATER
+    temp <- tibble(agent_nr = agent, bias, follow_bias, self, other, feedback, trial = seq(ntrials)) # HERE I SAVE ALSO OTHER; TO BETTER UNDERSTAND WHAT THE AGENT IS DOING
+
+    if (exists("df")) { df <- rbind(df, temp)} else{df <- temp} 
+    
+  }
+  return (df)
+}
+
+sim_df <- sim(nagents, ntrials, bias, follow_bias)
+
+# HERE I LAG THE OUTCOME_HAND: I WANT THE VARIABLE INFORMED BY PREVIOUS CHOICE AND FEEDBACK TO APPEAR IN THE CURRENT TRIAL
+sim_df$outcome_hand <- ifelse(lag(sim_df$feedback == 1 & sim_df$self == 0,1) | 
+                              lag(sim_df$feedback == 0 & sim_df$self == 1,1) , 
+                              1, -1)
+
+# MY PROCEDURE GENERATED SOME NAs (no outcome hand for the first trial in each agent), I REMOVE THOSE ROWS 
+sim_df <- sim_df[complete.cases(sim_df),]
+```
+
+### let's do some stan
+
+```{r}
+#sim_df <- sim_df %>% 
+  #subset(agent_nr == 1)
+
+data <- list(n = 1199, c = sim_df$self, outcome_hand = sim_df$outcome_hand) # why is one row missing?
+
+file <- file.path("K_attempt.stan")
+mod <- cmdstan_model(file, 
+                     cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+
+# The following command calls Stan with specific options.
+samples <- mod$sample(
+  data = data,
+  seed = 123,
+  chains = 2,
+  parallel_chains = 2,
+  threads_per_chain = 2,
+  iter_warmup = 1000,
+  iter_sampling = 2000,
+  refresh = 0,
+  max_treedepth = 20,
+  adapt_delta = 0.99,
+)
+```
+```{r}
+draws_df <- as_draws_df(samples$draws())
+
+```
+
+```{r}
+# Checking the model's chains
+ggplot(draws_df, aes(.iteration, follow_bias, group = .chain, color = .chain)) +
+  geom_line() +
+  theme_classic()
+
+# Plotting the estimates against the prior distribution
+# the dashed line is the true rate
+
+# add a prior for theta (ugly, but we'll do better soon)
+draws_df <- draws_df %>% 
+  mutate(fb_prior = rnorm(nrow(draws_df), 0, 1)
+)
+
+# Now let's plot the density for theta (prior and posterior)
+
+ggplot(draws_df) +
+  geom_density(aes(follow_bias), fill = "blue", alpha = 0.3) +
+  geom_density(aes(fb_prior), fill = "red", alpha = 0.3) +
+  geom_vline(xintercept = 0.8, linetype = "dashed", color = "black", linewidth = 1.5) +
+  xlab("Follow Bias") +
+  ylab("Posterior Density") +
+  theme_classic()
+```
+
+```{r}
+# add a prior for theta (ugly, but we'll do better soon)
+draws_df <- draws_df %>% 
+  mutate(b_prior = rnorm(nrow(draws_df), 0, 1)
+)
+
+# Now let's plot the density for theta (prior and posterior)
+
+ggplot(draws_df) +
+  geom_density(aes(bias), fill = "blue", alpha = 0.3) +
+  geom_density(aes(b_prior), fill = "red", alpha = 0.3) +
+  geom_vline(xintercept = 0.6, linetype = "dashed", color = "black", linewidth = 1.5) +
+  xlab("Bias") +
+  ylab("Posterior Density") +
+  theme_classic()
+```
+
+
+```{r}
+# Distribution of prior & posterior predictions
+ggplot(draws_df) +
+  geom_histogram(aes(prior_preds), color = "lightblue", fill = "blue", alpha = 0.3, bins = 90) +
+  geom_histogram(aes(posterior_preds), color = "darkblue", fill = "blue", alpha = 0.3, bins = 90) +
+  geom_point(x = sum(data$c), y = 0, color = "red", shape = 17, size = 5) +
+  xlab("Predicted heads out of 1200 trials") +
+  ylab("Posterior Density") +
+  theme_classic() + ggtitle('Prior and posterior predictions')
+```
+
+# Prior sensitivity analysis
+
+```{r}
+prior_mean_bias <- seq(0, 1, 0.1)
+prior_sd_bias <- seq(0.1, 1, 0.1)
+prior_mean_follow_bias <- seq(-2, 2, 0.25)
+prior_sd_follow_bias <- seq(0.1, 1, 0.1)
+priors <-  expand.grid(prior_mean_bias, prior_sd_bias, prior_mean_follow_bias, prior_sd_follow_bias)
+priors <- tibble(prior_mean_bias = priors$Var1, prior_sd_bias = priors$Var2, prior_mean_follow_bias = priors$Var3, prior_sd_follow_bias = priors$Var4)
+
+
+priors
+```
+
+```{r}
+randomChoice <- array(NA, ntrials)
+
+for (t in seq(ntrials)) { 
+      randomChoice[t] <- RandomAgentNoise_f(rate, noise)
+    }
+d1 <- tibble(trial = seq(ntrials), Other = randomChoice, rate, noise)
+
+```
+
+```{r}
+file <- file.path("Prior_sens.stan")
+
+mod <- cmdstan_model(file, 
+                     cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+
+pacman::p_load(future, purrr, furrr)
+plan(multisession, workers = 4)
+
+sim_df <- sim_df %>% 
+  select("self","outcome_hand")
+
+sim_d_and_fit <- function(prior_mean_bias, prior_sd_bias, prior_mean_follow_bias, prior_sd_follow_bias) {
+
+    data <- list(n = 1199, c = sim_df$self, outcome_hand = sim_df$outcome_hand, prior_mean_bias = prior_mean_bias, prior_sd_bias = prior_sd_bias, prior_mean_follow_bias = prior_mean_follow_bias, prior_sd_follow_bias = prior_sd_follow_bias)
+  
+    samples <- mod$sample(
+      data = data,
+      seed = 1000,
+      chains = 1,
+      parallel_chains = 1,
+      threads_per_chain = 1,
+      iter_warmup = 1000,
+      iter_sampling = 2000,
+      refresh = 0,
+      max_treedepth = 20,
+      adapt_delta = 0.99,
+    )
+    
+    draws_df <- as_draws_df(samples$draws()) 
+      temp <- tibble(bias_prior = draws_df$bias_prior, 
+                     bias_posterior = draws_df$bias_posterior, 
+                     follow_bias_prior = draws_df$follow_bias_prior, 
+                     follow_bias_posterior = draws_df$follow_bias_posterior,
+                     prior_preds = draws_df$prior_preds, 
+                     posterior_preds = draws_df$posterior_preds, 
+                     prior_mean_bias = prior_mean_bias,
+                     prior_sd_bias = prior_sd_bias,
+                     prior_mean_follow_bias = prior_mean_follow_bias,
+                     prior_sd_follow_bias = prior_sd_follow_bias)
+    
+    return(temp)
+  
+}
+
+recovery_df <- future_pmap_dfr(priors, sim_d_and_fit, .options = furrr_options(seed = TRUE))
+
+```
+
+```{r}
+
+ggplot(recovery_df, aes(prior_mean_bias, bias_posterior)) +
+  geom_point(alpha = 0.1) +
+  geom_hline(yintercept = 0.6, color = "red") +
+  geom_smooth(method = lm, se = FALSE)+
+  facet_wrap(.~prior_sd_bias) +
+  theme_classic()
+
+```
+
+
+
+```{r}
+
+ggplot(recovery_df, aes(prior_mean_follow_bias, follow_bias_posterior)) +
+  geom_point(alpha = 0.1) +
+  geom_hline(yintercept = 0.8, color = "red") +
+  geom_smooth(method = lm, se = FALSE) +
+  facet_wrap(.~prior_sd_follow_bias) +
+  theme_classic()
+
+```
+
+
+# Riccardos code
+```{r}
+# Simulating random agent
+
+pacman::p_load(tidyverse,
+        here,
+        posterior,
+        cmdstanr,
+        brms, tidybayes)
+
+trials <- 120
+
+RandomAgentNoise_f <- function(rate, noise) {
+
+  choice <- rbinom(1, 1, rate) # generating noiseless choices
+  
+  if (rbinom(1, 1, noise) == 1) {
+    choice = rbinom(1, 1, 0.5) # introducing noise
+  }
+  
+  return(choice)
+}
+
+d <- NULL
+for (noise in seq(0, 0.5, 0.1)) { # looping through noise levels
+
+  for (rate in seq(0, 1, 0.1)) { # looping through rate levels
+    randomChoice <- rep(NA, trials)
+    
+    for (t in seq(trials)) { # looping through trials (to make it homologous to more reactive models)
+      randomChoice[t] <- RandomAgentNoise_f(rate, noise)
+    }
+    temp <- tibble(trial = seq(trials), choice = randomChoice, rate, noise)
+    temp$cumulativerate <- cumsum(temp$choice) / seq_along(temp$choice)
+
+    if (exists("d")) {
+      d <- rbind(d, temp)
+    } else{
+      d <- temp
+    }
+  }
+}
+
+p1 <- ggplot(d, aes(trial, cumulativerate, group = rate, color = rate)) + 
+  geom_line() + 
+  geom_hline(yintercept = 0.5, linetype = "dashed") + 
+  ylim(0,1) + 
+  facet_wrap(.~noise) + 
+  theme_classic()
+p1
+
+```
+
+
+### MEMORY SIMULATION AND PRIOR SENSITIVY ANALYSIS BEGIN HERE
+```{r}
+# set up
+ntrials <- 120
+nagents <- 10
+bias <- 0.6
+follow_bias <- 0.8
+rate <- 0.5
+noise <- 0.2
+beta <- 0.65
+confidencerate <- 0.05 
+```
+
+
+```{r}
+RandomAgentNoise_f <- function(rate, noise) {
+  choice <- rbinom(1, 1, rate)
+  if (rbinom(1, 1, noise) == 1) 
+  {choice = rbinom(1, 1, 0.5)}
+  return(choice)
+  }
+```
+
+```{r}
+randomChoice <- array(NA, ntrials)
+
+for (t in seq(ntrials)) { 
+      randomChoice[t] <- RandomAgentNoise_f(rate, noise)
+    }
+d1 <- tibble(trial = seq(ntrials), Other = randomChoice, rate, noise)
+
+```
+
+
+```{r}
+
+# Now we create the memory agent whose beta changes based on winning or losing
+MemoryAgent_f <- function(bias, beta, memory, confidence){
+    choice = rbinom(1, 1, inv_logit_scaled(bias + (beta + confidence) * memory))
+  return(choice)
+}
+
+
+```
+
+```{r}
+# memory agent simulation function
+df <- NULL
+sim_mem <- function(nagents, ntrials, rate, noise, bias, beta, confidencerate){
+
+  for (agent in 1:nagents){
+    self <- rep(NA, ntrials) 
+    other <- rep(NA, ntrials) 
+    memory <- array(NA, ntrials)
+    confidence <- rep(NA, ntrials)
+    
+    self[1] <- rbinom(1, 1, 0.5)
+    other[1] <- rbinom(1, 1, 0.5)
+    confidence[1] <- 0
+    
+    # making other's choices
+    for (t in 1:ntrials) { 
+          other[t] <- RandomAgentNoise_f(rate, noise)
+        }
+    
+    # making memory
+    for (t in 1:ntrials){
+      if (t == 1) {
+        memory[t] = 0.5
+      } 
+      if (t < ntrials){
+          memory[t + 1] = memory[t] + ((other[t] - memory[t]) / t)
+          if (memory[t + 1] == 0){memory[t + 1] = 0.01}
+          if (memory[t + 1] == 1){memory[t + 1] = 0.99}
+      }
+    }
+    
+    # making self
+    for (t in 2:ntrials){ # first we update confidence based on previous trial
+      if (other[t-1] == self[t-1]){
+        confidence[t] = confidence[t-1] + confidencerate
+      }
+      else {
+        confidence[t] = confidence[t-1] - confidencerate
+      }
+      
+      self[t] <- MemoryAgent_f(bias, beta, memory[t], confidence[t])
+    }
+    
+    temp <- tibble(agent, trial = seq(ntrials), bias, beta, self, other, memory, 
+                   confidence = round(confidence, 2))
+
+    if (exists("df")) { df <- rbind(df, temp)} else{df <- temp} 
+    
+  }
+  return (df)
+}
+
+d1 <- sim_mem(nagents, ntrials, rate, noise, bias, beta, confidencerate)
+
+d1 <- d1 %>% 
+  mutate(beta_conf_combined = beta + confidence)
+```
+
+
+# Memory agent
+```{r}
+
+data <- list(n = 1200, h = d1$self, other = d1$other, prior_mean_bias = 0,prior_sd_bias = 1,  prior_mean_beta = 0, 
+             prior_sd_beta = 1,prior_mean_conf = 0, prior_sd_conf = 0.3 )
+file <- file.path("memo.stan")
+mod <- cmdstan_model(file, 
+                     cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+
+# The following command calls Stan with specific options.
+samples <- mod$sample(
+  data = data,
+  seed = 123,
+  chains = 2,
+  parallel_chains = 2,
+  threads_per_chain = 2,
+  iter_warmup = 1000,
+  iter_sampling = 2000,
+  refresh = 0,
+  max_treedepth = 20,
+  adapt_delta = 0.99,
+)
+
+```
+
+```{r}
+draws_df <- as_draws_df(samples$draws())
+
+
+
+
+ggplot(draws_df, aes(.iteration, bias, group = .chain, color = .chain)) +
+  geom_line() +
+  theme_classic()
+
+draws_df <- draws_df %>% 
+  mutate(b_prior = rnorm(nrow(draws_df), 0, .7),
+         beta_prior = rnorm(nrow(draws_df), 0, 1),
+         c_prior = rnorm(nrow(draws_df), 0, .3)
+)
+
+# Now let's plot the density for theta (prior and posterior)
+
+ggplot(draws_df) +
+  geom_density(aes(bias), fill = "blue", alpha = 0.3) +
+  geom_density(aes(b_prior), fill = "red", alpha = 0.3) +
+  geom_vline(xintercept = 0.6, linetype = "dashed", color = "black", linewidth = 1.5) +
+  xlab("Bias") +
+  ylab("Posterior Density") +
+  theme_classic()
+
+ggplot(draws_df) +
+  geom_density(aes(beta), fill = "blue", alpha = 0.3) +
+  geom_density(aes(beta_prior), fill = "red", alpha = 0.3) +
+  geom_vline(xintercept = 0.65, linetype = "dashed", color = "black", linewidth = 1.5) +
+  xlab("Beta") +
+  ylab("Posterior Density") +
+  theme_classic()
+
+ggplot(draws_df) +
+  geom_density(aes(confidencerate), fill = "blue", alpha = 0.3) +
+  geom_density(aes(c_prior), fill = "red", alpha = 0.3) +
+  geom_vline(xintercept = 0.05, linetype = "dashed", color = "black", linewidth = 1.5) +
+  xlab("Confidence rate") +
+  ylab("Posterior Density") +
+  theme_classic()
+```
+```{r}
+#Priors
+prior_mean_bias <- seq(0, 1, 0.25)
+prior_sd_bias <- seq(0.1, 1, .3)
+prior_mean_beta <- seq(0, 1, 0.25)
+prior_sd_beta <- seq(0.1, 1, .3)
+prior_mean_conf <- seq(-2, 2, 0.5)
+prior_sd_conf <- seq(0.1, 1, .3)
+priors <-  expand.grid(prior_mean_bias, prior_sd_bias, prior_mean_beta, prior_sd_beta, prior_mean_conf, prior_sd_conf)
+priors <- tibble(prior_mean_bias = priors$Var1, prior_sd_bias = priors$Var2, prior_mean_beta = priors$Var3, prior_sd_beta = priors$Var4, prior_mean_conf = priors$Var5, prior_sd_conf = priors$Var6)
+
+
+priors
+```
+
+
+```{r}
+file <- file.path("mem_prior_sens.stan")
+
+mod <- cmdstan_model(file, 
+                     cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+
+pacman::p_load(future, purrr, furrr)
+plan(multisession, workers = 4)
+
+sim_d_and_fit <- function(prior_mean_bias, prior_sd_bias, prior_mean_beta, prior_sd_beta, prior_mean_conf, prior_sd_conf) {
+
+    data <- list(n = 1200, h = d1$self, memory = d1$memory, confidence = d1$confidence, prior_mean_bias = prior_mean_bias, prior_sd_bias = prior_sd_bias, prior_mean_beta = prior_mean_beta, prior_sd_beta = prior_sd_beta, prior_mean_conf = prior_mean_conf, prior_sd_conf = prior_sd_conf)
+  
+    samples <- mod$sample(
+      data = data,
+      seed = 1000,
+      chains = 1,
+      parallel_chains = 1,
+      threads_per_chain = 1,
+      iter_warmup = 1000,
+      iter_sampling = 2000,
+      refresh = 0,
+      max_treedepth = 20,
+      adapt_delta = 0.99,
+    )
+    
+    draws_df <- as_draws_df(samples$draws()) 
+      temp <- tibble(bias_prior = draws_df$bias_prior, 
+                     bias_posterior = draws_df$bias_posterior, 
+                     beta_prior = draws_df$beta_prior, 
+                     beta_posterior = draws_df$beta_posterior,
+                     conf_prior = draws_df$conf_prior,
+                     conf_posterior = draws_df$conf_posterior,
+                     prior_preds = draws_df$prior_preds, 
+                     posterior_preds = draws_df$posterior_preds, 
+                     prior_mean_bias = prior_mean_bias,
+                     prior_sd_bias = prior_sd_bias,
+                     prior_mean_beta = prior_mean_beta,
+                     prior_sd_beta = prior_sd_beta,
+                     prior_mean_conf = prior_mean_conf,
+                     prior_sd_conf = prior_sd_conf)
+    
+    return(temp)
+  
+}
+
+recovery_df1 <- future_pmap_dfr(priors, sim_d_and_fit, .options = furrr_options(seed = TRUE))
+
+```
+
+```{r}
+
+ggplot(recovery_df1, aes(prior_mean_bias, bias_posterior)) +
+  geom_point(alpha = 0.1) +
+  geom_hline(yintercept = 0.6, color = "red") +
+  geom_smooth(method = lm, se = FALSE)+
+  facet_wrap(.~prior_sd_bias) +
+  theme_classic()
+
+```
+
+```{r}
+
+ggplot(recovery_df1, aes(prior_mean_beta, beta_posterior)) +
+  geom_point(alpha = 0.1) +
+  geom_hline(yintercept = 0.5, color = "red") +
+  geom_smooth(method = lm, se = FALSE) +
+  facet_wrap(.~prior_sd_beta) +
+  theme_classic()
+
+```
+
+```{r}
+
+ggplot(recovery_df1, aes(prior_mean_conf, conf_posterior)) +
+  geom_point(alpha = 0.1) +
+  geom_hline(yintercept = 0.1, color = "red") +
+  geom_smooth(method = lm, se = FALSE) +
+  facet_wrap(.~prior_sd_conf) +
+  theme_classic()
+
+```
