@@ -1,0 +1,221 @@
+---
+title: "ParamRecovLSWS"
+output: html_document
+date: "2023-03-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# packages
+
+pacman::p_load(tidyverse,
+        here,
+        posterior,
+        cmdstanr,
+        brms, 
+        tidybayes,
+        bayesplot,
+        ggpubr)
+
+# load function from source
+source("RandomAgentNoise_f.R")
+source("LSWSAgentNoise_f.R")
+source("LSWSAgentBias_f.R")
+
+```
+
+
+## Matching pennies with LSWS 
+
+
+### Simulating data
+```{r}
+# set up
+ntrials <- 120
+nagents <- 10
+#bias <- 0.6
+follow_bias <- 0.8
+rate <- 0.5
+#noise <- 0.2
+
+df <- NULL
+sim <- function(nagents, ntrials, bias, follow_bias, rate, noise){
+
+  for (agent in 1:nagents){
+    self <- rep(NA, ntrials) 
+    other <- rep(NA, ntrials) 
+    feedback <- rep(NA, ntrials)
+    bias <- rep(NA, ntrials)
+    follow_bias <- rep(NA, ntrials)
+   # noise <- rep(NA, ntrials)
+    self[1] <- rbinom(1, 1, 0.5)
+    other[1] <- rbinom(1, 1, 0.5)
+    # HERE I REMOVED THE FEEDBACK LINE
+  #  for (noise in seq(0,0.5, 0.1)){  #  loop through different noise levels
+      for (biasT in seq(0,1,0.1)){  # loop through different bias levels
+        for (followBiasT in seq(0, 1, 0.1)){  # loop through different follow bias levels
+      
+    for (i in 2:ntrials){ # HERE I GENERATE FEEDBACK BASED ON THE PREVIOUS TRIAL TO INFORM THE CURRENT TRIAL
+      if (self[i-1] == other[i-1]){ 
+          feedback[i-1] = 1 } 
+        else {
+          feedback[i-1] = 0 } 
+        self[i] <- LSWSAgentBias_f(self[i-1], feedback[i-1], biasT, followBiasT) # HERE I USE PREVIOUS CHOICE AND PREV FEEDBACK TO GENERATE CURRENT CHOICE
+        other[i] <- RandomAgentNoise_f(rate = 0.5, noise = 0.1) 
+    }
+    feedback[ntrials] <- ifelse(self[ntrials] == other[ntrials], 1, 0) # HERE I GENERATE FEEDBACK FOR THE LAST TRIAL, TO AVOID LOSING THAT ROW LATER
+temp <- tibble(agent_nr = agent, biasT, followBiasT, self, other, feedback, trial = seq(ntrials)) # HERE I SAVE ALSO OTHER; TO BETTER UNDERSTAND WHAT THE AGENT IS DOING (noise is removed)
+    if (exists("df")) { df <- rbind(df, temp)} else{df <- temp} 
+    
+    }
+ 
+
+} # Kristian Made this
+    }
+  #} noise curly bracket  
+   return (df)}
+sim_df <- sim(nagents, ntrials, bias, follow_bias, rate, noise)
+
+# HERE I LAG THE OUTCOME_HAND: I WANT THE VARIABLE INFORMED BY PREVIOUS CHOICE AND FEEDBACK TO APPEAR IN THE CURRENT TRIAL
+sim_df$outcome_hand <- ifelse(lag(sim_df$feedback == 1 & sim_df$self == 0,1) | 
+                              lag(sim_df$feedback == 0 & sim_df$self == 1,1) , 
+                              1, -1)
+
+# MY PROCEDURE GENERATED SOME NAs (no outcome hand for the first trial in each agent), I REMOVE THOSE ROWS 
+sim_df <- sim_df[complete.cases(sim_df),]
+```
+
+### let's do some stan
+```{r}
+# parameter recovery is put in for loops that loop through unique values for our parameters
+recor_df <- NULL
+
+# for (noiseLvl in unique(sim_df$noise)){
+  for (biasLvl in unique(sim_df$biasT)){
+    for (followBiasLvl in unique(sim_df$followBiasT)){
+      d <- sim_df %>% 
+        filter(biasT == biasLvl & followBiasT == followBiasLvl 
+               #& noise == noiseLvl
+        )
+      # make rows the same length by hardcoding
+      d <- d[1:119,]
+      #feed the data 
+      data = list(n = 119, c = d$self, outcome_hand = d$outcome_hand)
+      # stan model
+      file <- file.path("LSWS.stan")
+      mod <- cmdstan_model(file, 
+                           cpp_options = list(stan_threads = TRUE),
+                           stanc_options = list("O1"))
+      
+      # The following command calls Stan with specific options.
+      samples <- mod$sample(
+        data = data,
+        seed = 123,
+        chains = 2,
+        parallel_chains = 2,
+        threads_per_chain = 2,
+        iter_warmup = 1000,
+        iter_sampling = 2000,
+        refresh = 0,
+        max_treedepth = 20,
+        adapt_delta = 0.99,
+      )
+        draws_df <- as_draws_df(samples$draws()) 
+        temp <- tibble(biasEst = inv_logit_scaled(draws_df$bias),
+                       biasTrue = biasLvl,
+                       follow_biasEst = inv_logit_scaled(draws_df$follow_bias),
+                       follow_biasTrue = followBiasLvl
+                       #,noise = noiseLvl
+        )
+        
+        if (exists("recor_df")) { recor_df <- rbind(recor_df, temp)} else{recor_df <- temp} 
+    
+    }
+  }
+#}  noise curly bracket
+```
+
+
+```{r}
+# get summary
+samples$summary()
+
+# Convert to data frame using posterior::as_draws_df
+draws_df <- as_draws_df(samples$draws())
+
+# plot parameters
+mcmc_hist(samples$draws("follow_bias"))  # follow bias
+mcmc_hist(samples$draws("bias"))  # bias
+mcmc_hist(samples$draws("follow_bias_prior"))  # follow bias
+mcmc_hist(samples$draws("bias_prior"))  # bias
+
+```
+
+```{r}
+# Checking the model's chains
+ggplot(draws_df, aes(.iteration, follow_bias, group = .chain, color = .chain)) +
+  geom_line() +
+  theme_classic()
+
+# Plotting the estimates against the prior distribution
+# the dashed line is the true rate
+
+# add a prior for follow bias
+draws_df <- draws_df %>% 
+  mutate(fb_prior = rnorm(nrow(draws_df), 0, 1)
+)
+
+# Now let's plot the density for follow bias (prior and posterior)
+ggplot(draws_df) +
+  geom_density(aes(follow_bias), fill = "blue", alpha = 0.3) +
+  geom_density(aes(fb_prior), fill = "red", alpha = 0.3) +
+  geom_vline(xintercept = 0.8, linetype = "dashed", color = "black", linewidth = 1.5) +
+  xlab("Follow Bias") +
+  ylab("Posterior Density") +
+  theme_classic()
+```
+
+```{r}
+# add a prior for bias 
+draws_df <- draws_df %>% 
+  mutate(b_prior = rnorm(nrow(draws_df), 0, 1)
+)
+
+# Now let's plot the density for bias (prior and posterior)
+ggplot(draws_df) +
+  geom_density(aes(bias), fill = "blue", alpha = 0.3) +
+  geom_density(aes(b_prior), fill = "red", alpha = 0.3) +
+  geom_vline(xintercept = 0.6, linetype = "dashed", color = "black", linewidth = 1.5) +
+  xlab("Bias") +
+  ylab("Posterior Density") +
+  theme_classic()
+```
+
+```{r}
+# plot recovered bias
+bias_p <- ggplot(recor_df, aes(biasTrue, biasEst)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth() +
+  #facet_wrap(.~noise) +
+  theme_classic()+
+  ggtitle("Bias Recovered")+
+    theme(plot.title = element_text(size = 20, face = "bold"))
+
+# plot recovered follow bias
+follow_bias_p <- ggplot(recor_df, aes(follow_biasTrue, follow_biasEst)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth() +
+  #facet_wrap(.~noise) +
+  theme_classic()+
+  ggtitle("Follow Bias Recovered")+
+    theme(plot.title = element_text(size = 20, face = "bold"))
+
+# arrange the two plots
+ggarrange(bias_p, follow_bias_p, ncol = 1, nrow = 2)
+
+```
+
