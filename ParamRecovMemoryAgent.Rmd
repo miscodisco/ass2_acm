@@ -1,0 +1,281 @@
+---
+title: "ParameterRecoveryMA"
+author: "Kristian Severin"
+date: "2023-03-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# packages
+
+pacman::p_load(tidyverse,
+        here,
+        posterior,
+        cmdstanr,
+        brms, 
+        tidybayes,
+        bayesplot,
+        ggpubr)
+
+# load function from source
+source("RandomAgentNoise_f.R")
+source("LSWSAgentNoise_f.R")
+source("LSWSAgentBias_f.R")
+source("MemoryAgent_f.R")
+
+```
+
+```{r}
+
+### Simulating data
+# set up
+ntrials <- 120
+nagents <- 10
+bias <- 0.6
+follow_bias <- 0.8
+rate <- 0.5
+noise <- 0.2
+beta <- 0.5
+confidencerate <- 0.05
+
+```
+
+```{r}
+# memory agent simulation function
+df <- NULL
+sim_mem <- function(nagents, ntrials, rate, noise, bias, beta, confidencerate){
+
+  for (agent in 1:nagents){
+    self <- rep(NA, ntrials) 
+    other <- rep(NA, ntrials) 
+    memory <- array(NA, ntrials)
+    confidence <- array(NA, ntrials)
+    
+    self[1] <- rbinom(1, 1, 0.5)
+    other[1] <- rbinom(1, 1, 0.5)
+    confidence[1] <- 0
+    
+    for (bias in seq(0, 1, 0.1)){
+      for (beta in seq(0, 1, 0.1)){
+        for (confidencerate in seq(0, 1, 0.1)){
+    
+    # making other's choices
+    for (t in 1:ntrials) { 
+          other[t] <- RandomAgentNoise_f(rate, noise)
+        }
+    
+    # making memory
+    for (t in 1:ntrials){
+      if (t == 1) {
+        memory[t] = 0.5
+      } 
+      if (t < ntrials){
+          memory[t + 1] = memory[t] + ((other[t] - memory[t]) / t)
+          if (memory[t + 1] == 0){memory[t + 1] = 0.01}
+          if (memory[t + 1] == 1){memory[t + 1] = 0.99}
+      }
+    }
+    
+    # making self
+    for (t in 2:ntrials){ # first we update confidence based on previous trial
+      if (other[t-1] == self[t-1]){
+        confidence[t] = confidence[t-1] + confidencerate
+      }
+      else {
+        confidence[t] = confidence[t-1] - confidencerate
+      }
+      
+      self[t] <- MemoryAgent_f(bias, beta, memory[t], confidence[t])
+    }
+    
+    temp <- tibble(agent, trial = seq(ntrials), bias, beta, self, other, memory, 
+                   confidence = round(confidence, 2))
+
+    if (exists("df")) { df <- rbind(df, temp)} else{df <- temp} 
+    
+        }
+      }
+    }
+  }
+  return (df)
+}
+
+d1 <- sim_mem(nagents, ntrials, rate, noise, bias, beta, confidencerate)
+
+d1 <- d1 %>% 
+  mutate(beta_conf_combined = beta + confidence)
+
+
+```
+
+
+```{r}
+
+# force confidence to not be 0 or 1
+d1$confidence <- ifelse(d1$confidence == 0, 0.01, d1$confidence)
+d1$confidence <- ifelse(d1$confidence == 1, 0.99, d1$confidence)
+
+# remove values that are conceptually irrelevant
+d1 <- filter(d1, d1$confidence > 0)
+# remove values that are conceptually irrelevant
+d1 <- filter(d1, confidence > 0 & confidence < 0.5)
+
+```
+
+
+This chunk errors the chunk below is what produced the plot
+```{r}
+ recor_df1 <- NULL
+   for (confidencerateLvl in unique(d1$confidence)){
+     for (biasLvl in unique(d1$bias)){
+       for (betaLvl in unique(d1$beta)){
+ 
+     d <- d1 %>% 
+         filter(confidence == confidencerateLvl & bias == biasLvl & beta == betaLvl) 
+     
+     print(paste0("bias = ", biasLvl, " beta = ", betaLvl, " confidence = ", confidenceLvl ))
+     
+      # make rows the same length by hardcoding
+      #d <- d[1:119,]
+     
+           
+      data <- list(n = nrow(d), h = d$self, 
+                   other = d$other, 
+                   prior_mean_bias = 0,
+                   prior_sd_bias = 1,  
+                   prior_mean_beta = 0, 
+                   prior_sd_beta = 1,
+                   prior_mean_conf = 0, 
+                   prior_sd_conf = 0.3 )
+      file <- file.path("memoryagent.stan")
+      mod <- cmdstan_model(file, 
+                           cpp_options = list(stan_threads = TRUE),
+                           stanc_options = list("O1"))
+      
+      # The following command calls Stan with specific options.
+      samples <- mod$sample(
+        data = data,
+        seed = 123,
+        chains = 2,
+        parallel_chains = 2,
+        threads_per_chain = 2,
+        iter_warmup = 1000,
+        iter_sampling = 2000,
+        refresh = 0,
+        max_treedepth = 20,
+        adapt_delta = 0.99,
+      )
+             draws_df <- as_draws_df(samples$draws()) 
+             temp <- tibble(
+                       biasEst = draws_df$bias,
+                       biasTrue = biasLvl,
+                       confidenceRateEst = draws_df$confidencerate,
+                       confidenceRateTrue = confidencerateLvl,
+                       betaEst = draws_df$beta,
+                       betaTrue = betaLvl)
+     
+      if (exists("recor_df1")) { recor_df1 <- rbind(recor_df1, temp)} else{recor_df1 <- temp} 
+    
+       }
+   }
+ } 
+```
+```{r}
+recor_df1 <- NULL
+   for (confidencerateLvl in unique(d1$confidence)){
+     
+     d <- d1 %>% 
+         filter(confidence == confidencerateLvl) 
+     
+     print(paste0(" confidence = ", confidenceLvl ))
+     
+      # make rows the same length by hardcoding
+      #d <- d[1:119,]
+     
+           
+      data <- list(n = nrow(d), h = d$self, 
+                   other = d$other, 
+                   prior_mean_bias = 0,
+                   prior_sd_bias = 1,  
+                   prior_mean_beta = 0, 
+                   prior_sd_beta = 1,
+                   prior_mean_conf = 0, 
+                   prior_sd_conf = 0.3 )
+      file <- file.path("memoryagent.stan")
+      mod <- cmdstan_model(file, 
+                           cpp_options = list(stan_threads = TRUE),
+                           stanc_options = list("O1"))
+      
+      # The following command calls Stan with specific options.
+      samples <- mod$sample(
+        data = data,
+        seed = 123,
+        chains = 2,
+        parallel_chains = 2,
+        threads_per_chain = 2,
+        iter_warmup = 1000,
+        iter_sampling = 2000,
+        refresh = 0,
+        max_treedepth = 20,
+        adapt_delta = 0.99,
+      )
+             draws_df <- as_draws_df(samples$draws()) 
+             temp <- tibble(
+                       confidenceRateEst = draws_df$confidencerate,
+                       confidenceRateTrue = confidencerateLvl)
+     
+      if (exists("recor_df1")) { recor_df1 <- rbind(recor_df1, temp)} else{recor_df1 <- temp} 
+    
+       }
+
+```
+
+
+
+
+```{r}
+# plot recovered bias
+bias_p <- ggplot(param_recov_df, aes(biasTrue, biasEst)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth() +
+  theme_classic()+
+  ggtitle("Bias Recovered")+
+    theme(plot.title = element_text(size = 20, face = "bold"))
+
+# plot recovered beta
+beta_p <- ggplot(param_recov_df, aes(betaTrue, betaEst)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth() +
+  theme_classic()+
+  ggtitle("Beta Recovered")+
+    theme(plot.title = element_text(size = 20, face = "bold"))
+
+# plot recovered confidencerate
+confidenceRate_p <- ggplot(param_recov_df, aes(confidenceRateTrue, confidenceRateEst)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth() +
+  theme_classic()+
+  ggtitle("Confidencerate Recovered")+
+    theme(plot.title = element_text(size = 20, face = "bold"))
+
+# arrange the two plots
+ggarrange(bias_p, beta_p, ncol = 1, nrow = 3)
+
+```
+
+```{r}
+# plot recovered confidencerate
+confidenceRate_p <- ggplot(recor_df1, aes(confidenceRateTrue, confidenceRateEst)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth() +
+  theme_classic()+
+  ggtitle("Confidencerate Recovered")+
+    theme(plot.title = element_text(size = 20, face = "bold"))
+
+confidenceRate_p
+```
+
